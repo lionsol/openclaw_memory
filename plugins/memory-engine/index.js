@@ -245,7 +245,11 @@ export default definePluginEntry({
                 if (!meta || meta.is_archived) continue;
                 const rtConf = calcRealtimeConf(meta, nowSec);
                 const similarity = c.similarity ?? c.score ?? 0.5;
-                const finalScore = 0.7 * similarity + 0.3 * rtConf;
+                let finalScore = 0.7 * similarity + 0.3 * rtConf;
+                const KG_BOOST = 0.03;
+                if (meta.category === 'kg_node' && rtConf > 0.3) {
+                  finalScore += KG_BOOST;
+                }
                 scored.push({
                   id: id.slice(0, 16),
                   text: (c.text || c.content || "").slice(0, 200),

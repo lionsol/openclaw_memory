@@ -45,6 +45,7 @@ function withDb(fn) {
 }
 
 function calculateTau(hits, baseTau) {
+  if (hits < 0) hits = 0;  // clamp negative
   if (baseTau >= CONFIG.TAU_MAX) return baseTau;
   return baseTau + (CONFIG.TAU_MAX - baseTau) * (1 - Math.exp(-CONFIG.BETA * hits));
 }
@@ -183,65 +184,115 @@ function updateChunk(partialId, opts = {}) {
   });
 }
 
-// === Hybrid Search (confidence-weighted) ===
+// === Hybrid Search (real vector similarity + confidence) ===
 function hybridSearch(queryText, topK = 5) {
-  withDb(db => {
-    const now = Math.floor(Date.now() / 1000);
+  // Get API key from config
+  let apiKey = '';
+  const configPath = path.resolve(HOME, '.openclaw/openclaw.json');
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const providers = cfg.models?.providers || {};
+    apiKey = providers.siliconflow?.apiKey
+      || providers['siliconflow-embed']?.apiKey
+      || '';
+  } catch (e) {}
 
+  // Embed query text via SiliconFlow
+  let queryEmbedding = null;
+  try {
+    const resp = JSON.parse(execSync(
+      `curl -s -X POST "https://api.siliconflow.cn/v1/embeddings" ` +
+      `-H "Authorization: Bearer ${apiKey}" ` +
+      `-H "Content-Type: application/json" ` +
+      `-d '{"model":"Qwen/Qwen3-Embedding-4B","input":${JSON.stringify(queryText)},"encoding_format":"float"}'`,
+      { encoding: 'utf-8', timeout: 15000 }
+    ));
+    queryEmbedding = resp.data?.[0]?.embedding;
+  } catch (e) {
+    console.log(JSON.stringify({ action: 'search', error: 'embedding_failed', message: e.message }));
+  }
+
+  if (!queryEmbedding) {
+    // Fallback: confidence-only sort
+    withDb(db => {
+      const now = Math.floor(Date.now() / 1000);
+      const rows = db.prepare(`
+        SELECT c.id, c.text, COALESCE(mc.confidence, 0.5) as confidence,
+          mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+          COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+          COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+        FROM chunks c LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+        WHERE COALESCE(mc.is_archived, 0) = 0
+      `).all();
+      const scored = rows.map(row => {
+        const rtConf = row.is_protected ? row.confidence
+          : calcRtConf(row, now, row.conflict_flag);
+        return { id: row.id, text: row.text, category: row.category, confidence_realtime: Math.round(rtConf * 10000) / 10000, hit_count: row.hit_count, is_protected: row.is_protected, conflict_flag: row.conflict_flag };
+      });
+      scored.sort((a, b) => b.confidence_realtime - a.confidence_realtime);
+      const top = scored.slice(0, topK);
+      console.log(JSON.stringify({ action: 'search', diagnostics: { query: queryText, mode: 'confidence_only', pool_size: rows.length, returned: top.length, top_scores: top.map(r => ({ id: r.id.slice(0, 16), conf: r.confidence_realtime, hits: r.hit_count, cat: r.category, summary: r.text.slice(0, 60).replace(/\n/g, ' ') })) } }));
+      console.log('---RESULTS---');
+      top.forEach(r => console.log(JSON.stringify(r)));
+    });
+    return;
+  }
+
+  // Full hybrid search: cosine similarity + confidence decay
+  const now = Math.floor(Date.now() / 1000);
+  const alpha = 0.7;
+
+  function cosineSim(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+  }
+
+  withDb(db => {
     const rows = db.prepare(`
-      SELECT c.id, c.text, c.model,
-             COALESCE(mc.confidence, 0.5) as confidence,
-             mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
-             COALESCE(mc.hit_count, 0) as hit_count,
-             COALESCE(mc.is_protected, 0) as is_protected,
-             COALESCE(mc.conflict_flag, 0) as conflict_flag,
-             COALESCE(mc.category, 'raw_log') as category
-      FROM chunks c
-      LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+      SELECT c.id, c.text, c.embedding,
+        COALESCE(mc.confidence, 0.5) as confidence,
+        mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+        COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+        COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+      FROM chunks c LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
       WHERE COALESCE(mc.is_archived, 0) = 0
-      ORDER BY c.updated_at DESC
     `).all();
 
-    const poolSize = rows.length;
-    const scored = rows.map(row => {
-      let rtConf;
-      if (row.is_protected) {
-        rtConf = row.confidence;
-      } else {
-        const deltaDays = row.last_confidence_update
-          ? (now - row.last_confidence_update) / 86400 : 0;
-        const tau = calculateTau(row.hit_count, row.base_tau);
-        const decay = Math.exp(-deltaDays / tau);
-        rtConf = Math.max(0, row.confidence * decay
-          - (row.conflict_flag ? CONFIG.CONFLICT_PENALTY : 0));
-      }
-      return {
-        id: row.id,
-        text: row.text,
-        category: row.category,
-        confidence_snapshot: row.confidence,
-        confidence_realtime: Math.round(rtConf * 10000) / 10000,
-        hit_count: row.hit_count,
-        is_protected: row.is_protected,
-        conflict_flag: row.conflict_flag,
-      };
-    });
+    const scored = [];
+    for (const row of rows) {
+      try {
+        const storedEmb = JSON.parse(row.embedding);
+        if (!storedEmb || storedEmb.length < 100) continue;
+        const similarity = cosineSim(queryEmbedding, storedEmb);
+        if (similarity < 0.35) continue; // gate (Qwen3-Embedding-4B threshold)
+        const rtConf = row.is_protected ? row.confidence : calcRtConf(row, now, row.conflict_flag);
+        const finalScore = alpha * similarity + (1 - alpha) * rtConf;
+        scored.push({
+          id: row.id, text: row.text, category: row.category,
+          similarity: Math.round(similarity * 10000) / 10000,
+          confidence_realtime: Math.round(rtConf * 10000) / 10000,
+          final_score: Math.round(finalScore * 10000) / 10000,
+          hit_count: row.hit_count, is_protected: row.is_protected,
+        });
+      } catch (e) {}
+    }
 
-    // Sort by realtime confidence (proxy for relevance)
-    scored.sort((a, b) => b.confidence_realtime - a.confidence_realtime);
+    scored.sort((a, b) => b.final_score - a.final_score);
     const top = scored.slice(0, topK);
 
     console.log(JSON.stringify({
       action: 'search',
       diagnostics: {
-        query: queryText,
-        pool_size: poolSize,
-        returned: top.length,
+        query: queryText, mode: 'hybrid', alpha,
+        pool_size: rows.length, gated: scored.length, returned: top.length,
         top_scores: top.map(r => ({
-          id: r.id.slice(0, 16),
-          conf: r.confidence_realtime,
-          hits: r.hit_count,
-          cat: r.category,
+          id: r.id.slice(0, 16), sim: r.similarity, conf: r.confidence_realtime,
+          score: r.final_score, hits: r.hit_count, cat: r.category,
           summary: r.text.slice(0, 60).replace(/\n/g, ' '),
         })),
       },
@@ -249,6 +300,14 @@ function hybridSearch(queryText, topK = 5) {
     console.log('---RESULTS---');
     top.forEach(r => console.log(JSON.stringify(r)));
   });
+}
+
+function calcRtConf(row, now, conflictFlag) {
+  const deltaDays = row.last_confidence_update
+    ? (now - row.last_confidence_update) / 86400 : 0;
+  const tau = calculateTau(row.hit_count, row.base_tau);
+  const decay = Math.exp(-deltaDays / tau);
+  return Math.max(0, row.confidence * decay - (conflictFlag ? CONFIG.CONFLICT_PENALTY : 0));
 }
 
 // === Archive ===
