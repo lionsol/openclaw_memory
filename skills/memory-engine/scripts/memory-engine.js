@@ -198,7 +198,7 @@ function ftsSearch(queryText, limit = 20) {
 
   return withDb(db => {
     const rows = db.prepare(`
-      SELECT c.id, c.text,
+      SELECT c.id, c.text, rank as bm25_score,
         COALESCE(mc.confidence, 0.5) as confidence,
         mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
         COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
@@ -218,11 +218,37 @@ function ftsSearch(queryText, limit = 20) {
 // === RRF Fusion — 等权融合多通道排序结果 ===
 // 对每个候选：RRF(d) = Σ 1/(k + rᵢ(d))
 // k=60 是标准值，rᵢ(d) 是 d 在第 i 个通道的排位（0-based → 1-based）
+// 支持 padded 通道：短通道未覆盖的候选视为 rank = padRank
 function rrfFuse(channels, k = 60) {
-  const fusion = new Map(); // id → {item, rrfScore, ranks: {channel: rank}}
+  const allIds = new Set();
+  const padInfo = {}; // channel → {padded, padRank}
 
-  for (const [channelName, rankedItems] of Object.entries(channels)) {
-    rankedItems.forEach((item, idx) => {
+  for (const [chName, rankedItems] of Object.entries(channels)) {
+    // 检查是否标记为 padded
+    const isPadded = rankedItems.__padded === true;
+    const padRank = rankedItems.__padRank || (k + 100);
+    padInfo[chName] = { padded: isPadded, padRank };
+
+    // 收集所有出现的 ID
+    const effectiveItems = Array.isArray(rankedItems) ? rankedItems : [];
+    for (const item of effectiveItems) {
+      if (item && item.id) allIds.add(item.id);
+    }
+  }
+
+  // 构建融合结果
+  const fusion = new Map();
+
+  for (const [chName, rankedItems] of Object.entries(channels)) {
+    // 跳过元属性
+    if (chName.startsWith('__')) continue;
+
+    const effectiveItems = Array.isArray(rankedItems) ? rankedItems : [];
+    const { padded, padRank } = padInfo[chName];
+
+    // 处理本通道实际返回的条目
+    effectiveItems.forEach((item, idx) => {
+      if (!item || !item.id) return;
       const exist = fusion.get(item.id) || {
         id: item.id,
         text: item.text,
@@ -236,12 +262,20 @@ function rrfFuse(channels, k = 60) {
         ranks: {},
         rrfScore: 0,
       };
-      exist.sources.push(channelName);
-      exist.ranks[channelName] = idx + 1; // 1-based rank
-      // 累加 RRF 分数
+      exist.sources.push(chName);
+      exist.ranks[chName] = idx + 1;
       let acc = 0;
       for (const ch of Object.keys(exist.ranks)) {
         acc += 1 / (k + exist.ranks[ch]);
+      }
+      // 对 padded 通道中未出现但仍计入的候选
+      for (const [pch, info] of Object.entries(padInfo)) {
+        if (pch.startsWith('__')) continue;
+        if (!exist.ranks[pch] && info.padded) {
+          exist.ranks[pch] = info.padRank;
+          exist.sources.push(pch + '(pad)');
+          acc += 1 / (k + info.padRank);
+        }
       }
       exist.rrfScore = Math.round(acc * 10000) / 10000;
       fusion.set(item.id, exist);
@@ -251,6 +285,23 @@ function rrfFuse(channels, k = 60) {
   const results = Array.from(fusion.values());
   results.sort((a, b) => b.rrfScore - a.rrfScore);
   return results;
+}
+
+// === RRF 通道 padding — 短通道结果不足时排除孤例膨胀 ===
+// 某个通道返回远少于其他通道时，RRF 对该通道低排位候选贡献异常放大
+// 策略：通道结果 < padMin 时，对未覆盖的候选视为 rank = k + padOffset
+function rrfPad(channels, k = 60, padMin = 5, padOffset = 100) {
+  // 找出需要 padding 的通道
+  const channelNames = Object.keys(channels);
+  for (const name of channelNames) {
+    if (channels[name].length < padMin) {
+      // 该通道结果太少 → 其他通道有但此通道没有的候选，排名视为 k+padOffset
+      // 此函数在融合前调用，标记通道为 "padded"
+      channels[name].__padded = true;
+      channels[name].__padRank = k + padOffset;
+    }
+  }
+  return channels;
 }
 
 // === KG 召回桥 — 知识图谱概念 → chunks 映射 ===
@@ -419,9 +470,11 @@ function hybridSearch(queryText, topK = 5) {
   // 通道 2：FTS5 全文搜索
   const ftsResults = ftsSearch(queryText, ftsLimit);
   if (ftsResults.length > 0) {
+    // 归一化 BM25 分数：1/(1+|score|)，将 [-inf, 0] 映射到 (0, 1]
+    const maxAbsBm25 = Math.max(...ftsResults.map(r => Math.abs(r.bm25_score || 0)), 0.001);
     channels.fts = ftsResults.map(row => ({
       id: row.id, text: row.text, category: row.category,
-      similarity: 0.5,
+      similarity: Math.round((1 / (1 + Math.abs(row.bm25_score || 0))) * 10000) / 10000,
       confidence_realtime: row.is_protected ? row.confidence
         : Math.round(calcRtConf(row, now, row.conflict_flag) * 10000) / 10000,
       hit_count: row.hit_count,
@@ -473,6 +526,8 @@ function hybridSearch(queryText, topK = 5) {
 
   // ≥2 通道：RRF 融合
   const fusionMode = channelCount >= 3 ? 'rrf_multi' : 'rrf_dual';
+  // RRF padding + fusion
+  rrfPad(channels, rrfK);
   let fused = rrfFuse(channels, rrfK);
 
   // 时间意向检测 → episode 加权
