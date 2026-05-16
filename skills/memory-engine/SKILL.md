@@ -1,6 +1,6 @@
 ---
 name: memory-engine
-description: Memory confidence scoring + time-decay engine. Smart add (file → reindex → category-routed confidence) and hybrid search (confidence-weighted). Use when storing important facts that need long-term scoring, or when searching memory with relevance weighting.
+description: Memory confidence scoring + time-decay + FTS5 parallel recall engine. Smart add (file → reindex → category-routed confidence), hybrid search (vector + FTS5 parallel, RRF fusion). Use when storing important facts or searching with keyword precision.
 commands:
   - /memory add <text> [--category <temporary|raw_log|preference|kg_node|user_identity>] [--protected]
   - /memory search <query> [--top-k <n>]
@@ -9,16 +9,18 @@ commands:
   - /memory status
 ---
 
-# Memory Engine v1.1
+# Memory Engine v1.2
 
-Confidence + time-decay system with parallel storage.
+Confidence + time-decay system with parallel storage and multi-channel RRF search.
 
 ## Architecture
 
-- **chunks**（OpenClaw 所有）— 不变，只管内容和 embedding
+- **chunks**（OpenClaw 所有）— embedding + text
+- **chunks_fts**（OpenClaw 原生）— FTS5 全文索引，自动同步
 - **memory_confidence**（引擎所有）— 并行表，存储置信度、命中、分类、归档状态
-- **写入路径**：写文件 → `openclaw memory index`（生成向量）→ 写入 `memory_confidence`
+- **写入路径**：写文件 → `openclaw memory index`（生成向量 + FTS5）→ 写入 `memory_confidence`
 - **Embedding**: Qwen/Qwen3-Embedding-4B via SiliconFlow
+- **Search**: 双通道并行（向量 + FTS5）→ RRF 融合（≥2通道, k=60）
 - **Script**: `scripts/memory-engine.js`
 
 ## Category Routing

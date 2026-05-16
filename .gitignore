@@ -25,5 +25,26 @@ Thumbs.db
 # Logs
 *.log
 
-# Local Privacy
+# Workspace config (privacy)
 SKILL.md
+
+# Personal config (DO NOT PUSH)
+AGENTS.md
+SOUL.md
+USER.md
+IDENTITY.md
+TOOLS.md
+MEMORY.md
+HEARTBEAT.md
+DREAMS.md
+avatar-edi.jpg
+
+# Personal data
+duty-*.md
+knowledge-graph.json
+memory/
+data/
+
+# Agent local scripts
+scripts/duty-reminder.sh
+scripts/image-vision.py

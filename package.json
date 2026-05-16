@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@agentmemory/agentmemory": "^0.9.12",
+    "@askjo/camofox-browser": "^1.10.0"
+  }
+}

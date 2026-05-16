@@ -34,6 +34,7 @@ const CONFIG = {
 const CATEGORY_RULES = {
   temporary:       { conf: 0.40, tau: 2.0 },
   raw_log:         { conf: 0.50, tau: 7.0 },
+  episodic:        { conf: 0.70, tau: 30.0 },  // 情节摘要
   preference:      { conf: 0.70, tau: 30.0 },
   kg_node:         { conf: 0.85, tau: 90.0 },
   user_identity:   { conf: 0.95, tau: 365.0 },
@@ -59,6 +60,7 @@ function getCategoryParams(category, isProtected) {
 function smartAdd(text, opts = {}) {
   const category = opts.category || 'raw_log';
   const isProtected = opts.isProtected || false;
+  const kgData = opts.kgData || null;
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const ts = now.toISOString().replace(/[:.]/g, '').slice(0, 15);
@@ -71,7 +73,8 @@ function smartAdd(text, opts = {}) {
   const header = !fs.existsSync(filePath)
     ? '# Smart Added Memory\n\n' : '';
   const entryText = text.trim();
-  const entry = `${header}## ${entryId}\n\nCategory: ${category}${isProtected ? ' | Protected' : ''}\n\n${entryText}\n\n`;
+  const kgMeta = kgData ? `kg_data: ${JSON.stringify(kgData)}\n` : '';
+  const entry = `${header}## ${entryId}\n\nCategory: ${category}${isProtected ? ' | Protected' : ''}\n${kgMeta}\n${entryText}\n\n`;
 
   fs.appendFileSync(filePath, header ? entry : `\n${entry}`);
 
@@ -79,16 +82,17 @@ function smartAdd(text, opts = {}) {
     action: 'add', status: 'file_written',
     file: `${SMART_ADD_DIR}/${dateStr}.md`, entry_id: entryId,
     category, is_protected: isProtected ? 1 : 0,
+    has_kg_data: kgData ? true : false,
   }));
 
-  // Reindex (without --force to preserve our table)
+  // Reindex
   try {
     execSync('openclaw memory index --agent main 2>&1', { encoding: 'utf-8', timeout: 120000 });
   } catch (e) {
     console.log(JSON.stringify({ action: 'add', status: 'reindex_warn', message: e.message }));
   }
 
-  // Find newly indexed chunks for this file and add confidence entries
+  // Find newly indexed chunks and add confidence entries
   const filePattern = `memory/smart-add/${dateStr}.md`;
   withDb(db => {
     const newChunks = db.prepare(`
@@ -102,12 +106,13 @@ function smartAdd(text, opts = {}) {
       const insert = db.prepare(`
         INSERT INTO memory_confidence
           (chunk_id, initial_confidence, confidence, last_confidence_update,
-           base_tau, hit_count, is_archived, is_protected, conflict_flag, category)
-        VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?)
+           base_tau, hit_count, is_archived, is_protected, conflict_flag, category, kg_data)
+        VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?)
       `);
       const txn = db.transaction(ids => {
         for (const row of ids) {
-          insert.run(row.id, conf, conf, nowSec, tau, isProtected ? 1 : 0, category);
+          insert.run(row.id, conf, conf, nowSec, tau, isProtected ? 1 : 0, category,
+            kgData ? JSON.stringify(kgData) : null);
         }
       });
       txn(newChunks);
@@ -116,6 +121,7 @@ function smartAdd(text, opts = {}) {
         action: 'add', status: 'confidence_initialized',
         chunks: newChunks.length,
         category, confidence: conf, base_tau: tau,
+        has_kg_data: kgData ? true : false,
       }));
     } else {
       console.log(JSON.stringify({
@@ -184,8 +190,195 @@ function updateChunk(partialId, opts = {}) {
   });
 }
 
-// === Hybrid Search (real vector similarity + confidence) ===
+// === FTS5 Search — 精准命中专有名词/代码/API名称 ===
+function ftsSearch(queryText, limit = 20) {
+  // 清理查询：FTS5 特殊字符转义
+  const safeQuery = queryText.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!safeQuery) return [];
+
+  return withDb(db => {
+    const rows = db.prepare(`
+      SELECT c.id, c.text,
+        COALESCE(mc.confidence, 0.5) as confidence,
+        mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+        COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+        COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+      FROM chunks_fts f
+      JOIN chunks c ON c.id = f.id
+      LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+      WHERE chunks_fts MATCH ?
+        AND COALESCE(mc.is_archived, 0) = 0
+      ORDER BY bm25(chunks_fts, 0)
+      LIMIT ?
+    `).all(safeQuery, limit);
+    return rows;
+  });
+}
+
+// === RRF Fusion — 等权融合多通道排序结果 ===
+// 对每个候选：RRF(d) = Σ 1/(k + rᵢ(d))
+// k=60 是标准值，rᵢ(d) 是 d 在第 i 个通道的排位（0-based → 1-based）
+function rrfFuse(channels, k = 60) {
+  const fusion = new Map(); // id → {item, rrfScore, ranks: {channel: rank}}
+
+  for (const [channelName, rankedItems] of Object.entries(channels)) {
+    rankedItems.forEach((item, idx) => {
+      const exist = fusion.get(item.id) || {
+        id: item.id,
+        text: item.text,
+        category: item.category,
+        hit_count: item.hit_count,
+        is_protected: item.is_protected,
+        conflict_flag: item.conflict_flag,
+        confidence_realtime: item.confidence_realtime || 0,
+        similarity: item.similarity || 0,
+        sources: [],
+        ranks: {},
+        rrfScore: 0,
+      };
+      exist.sources.push(channelName);
+      exist.ranks[channelName] = idx + 1; // 1-based rank
+      // 累加 RRF 分数
+      let acc = 0;
+      for (const ch of Object.keys(exist.ranks)) {
+        acc += 1 / (k + exist.ranks[ch]);
+      }
+      exist.rrfScore = Math.round(acc * 10000) / 10000;
+      fusion.set(item.id, exist);
+    });
+  }
+
+  const results = Array.from(fusion.values());
+  results.sort((a, b) => b.rrfScore - a.rrfScore);
+  return results;
+}
+
+// === KG 召回桥 — 知识图谱概念 → chunks 映射 ===
+function kgRecall(queryText, limit = 15) {
+  const KG_JS = path.resolve(WORKSPACE, 'kg.js');
+  if (!fs.existsSync(KG_JS)) return [];
+
+  try {
+    // 搜索 KG 获取相关概念
+    const out = execSync(`node ${KG_JS} search ${JSON.stringify(queryText)} 2>/dev/null`, {
+      encoding: 'utf-8', timeout: 10000
+    }).trim();
+
+    if (!out || out.startsWith('ℹ️') || out.startsWith('❌') || out === '[]') return [];
+
+    let concepts = [];
+    try { concepts = JSON.parse(out); } catch (e) { return []; }
+    if (!Array.isArray(concepts) || concepts.length === 0) return [];
+
+    // 提取概念名列表
+    const conceptNames = concepts.map(c => c.name).filter(Boolean);
+    if (conceptNames.length === 0) return [];
+
+    // 用 FTS5 搜索这些概念名在 chunks 中的匹配
+    const now = Math.floor(Date.now() / 1000);
+    return withDb(db => {
+      const seen = new Set();
+      const results = [];
+
+      for (const name of conceptNames) {
+        // 每个概念名搜索 chunks_fts，取 top 3
+        const safeName = name.replace(/[^\w\s]/g, ' ').trim();
+        if (!safeName || safeName.length < 2) continue;
+
+        const rows = db.prepare(`
+          SELECT DISTINCT c.id, c.text, c.embedding,
+            COALESCE(mc.confidence, 0.5) as confidence,
+            mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+            COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+            COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+          FROM chunks_fts f
+          JOIN chunks c ON c.id = f.id
+          LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+          WHERE chunks_fts MATCH ?
+            AND COALESCE(mc.is_archived, 0) = 0
+          ORDER BY bm25(chunks_fts, 0)
+          LIMIT 3
+        `).all(safeName);
+
+        for (const row of rows) {
+          if (seen.has(row.id)) continue;
+          seen.add(row.id);
+          const rtConf = row.is_protected ? row.confidence
+            : calcRtConf(row, now, row.conflict_flag);
+          results.push({
+            id: row.id, text: row.text, category: row.category,
+            similarity: 0.5,  // 保守分
+            confidence_realtime: Math.round(rtConf * 10000) / 10000,
+            hit_count: row.hit_count,
+            is_protected: row.is_protected,
+            conflict_flag: row.conflict_flag,
+            kg_concepts: conceptNames,
+          });
+        }
+
+        if (results.length >= limit) break;
+      }
+
+      return results.slice(0, limit);
+    });
+  } catch (e) {
+    return [];
+  }
+}
+
+// === 向量搜索（内部）— cosine similarity + confidence decay ===
+function vectorSearch(queryEmbedding, now, db, topK = 30) {
+  const alpha = 0.7;
+  function cosineSim(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+  }
+
+  const rows = db.prepare(`
+    SELECT c.id, c.text, c.embedding,
+      COALESCE(mc.confidence, 0.5) as confidence,
+      mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+      COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+      COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+    FROM chunks c LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+    WHERE COALESCE(mc.is_archived, 0) = 0
+  `).all();
+
+  const scored = [];
+  for (const row of rows) {
+    try {
+      const storedEmb = JSON.parse(row.embedding);
+      if (!storedEmb || storedEmb.length < 100) continue;
+      const similarity = cosineSim(queryEmbedding, storedEmb);
+      if (similarity < 0.35) continue; // gate
+      const rtConf = row.is_protected ? row.confidence : calcRtConf(row, now, row.conflict_flag);
+      const finalScore = alpha * similarity + (1 - alpha) * rtConf;
+      scored.push({
+        id: row.id, text: row.text, category: row.category,
+        similarity: Math.round(similarity * 10000) / 10000,
+        confidence_realtime: Math.round(rtConf * 10000) / 10000,
+        final_score: Math.round(finalScore * 10000) / 10000,
+        hit_count: row.hit_count,
+        is_protected: row.is_protected,
+        conflict_flag: row.conflict_flag,
+      });
+    } catch (e) {}
+  }
+  scored.sort((a, b) => b.final_score - a.final_score);
+  return scored.slice(0, topK);
+}
+
+// === 多通道并行混合搜索（向量 + FTS5），RRF 融合 ===
 function hybridSearch(queryText, topK = 5) {
+  const vectorLimit = 30;  // 向量池：30 个候选
+  const ftsLimit = 20;     // FTS5 池：20 个候选
+  const rrfK = 60;         // RRF 常数
+
   // Get API key from config
   let apiKey = '';
   const configPath = path.resolve(HOME, '.openclaw/openclaw.json');
@@ -197,7 +390,7 @@ function hybridSearch(queryText, topK = 5) {
       || '';
   } catch (e) {}
 
-  // Embed query text via SiliconFlow
+  // Embed query text
   let queryEmbedding = null;
   try {
     const resp = JSON.parse(execSync(
@@ -212,94 +405,293 @@ function hybridSearch(queryText, topK = 5) {
     console.log(JSON.stringify({ action: 'search', error: 'embedding_failed', message: e.message }));
   }
 
-  if (!queryEmbedding) {
-    // Fallback: confidence-only sort
-    withDb(db => {
-      const now = Math.floor(Date.now() / 1000);
-      const rows = db.prepare(`
-        SELECT c.id, c.text, COALESCE(mc.confidence, 0.5) as confidence,
-          mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
-          COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
-          COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
-        FROM chunks c LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
-        WHERE COALESCE(mc.is_archived, 0) = 0
-      `).all();
-      const scored = rows.map(row => {
-        const rtConf = row.is_protected ? row.confidence
-          : calcRtConf(row, now, row.conflict_flag);
-        return { id: row.id, text: row.text, category: row.category, confidence_realtime: Math.round(rtConf * 10000) / 10000, hit_count: row.hit_count, is_protected: row.is_protected, conflict_flag: row.conflict_flag };
-      });
-      scored.sort((a, b) => b.confidence_realtime - a.confidence_realtime);
-      const top = scored.slice(0, topK);
-      console.log(JSON.stringify({ action: 'search', diagnostics: { query: queryText, mode: 'confidence_only', pool_size: rows.length, returned: top.length, top_scores: top.map(r => ({ id: r.id.slice(0, 16), conf: r.confidence_realtime, hits: r.hit_count, cat: r.category, summary: r.text.slice(0, 60).replace(/\n/g, ' ') })) } }));
-      console.log('---RESULTS---');
-      top.forEach(r => console.log(JSON.stringify(r)));
-    });
+  const now = Math.floor(Date.now() / 1000);
+
+  const channels = {};
+  const FUSION_METHOD = Object.keys(channels).length >= 3 ? 'rrf' : (Object.keys(channels).length === 2 ? 'rrf' : 'pass');
+
+  // 通道 1：向量搜索（含 confidence decay）
+  if (queryEmbedding) {
+    const vecResults = withDb(db => vectorSearch(queryEmbedding, now, db, vectorLimit));
+    if (vecResults.length > 0) channels.vector = vecResults;
+  }
+
+  // 通道 2：FTS5 全文搜索
+  const ftsResults = ftsSearch(queryText, ftsLimit);
+  if (ftsResults.length > 0) {
+    channels.fts = ftsResults.map(row => ({
+      id: row.id, text: row.text, category: row.category,
+      similarity: 0.5,
+      confidence_realtime: row.is_protected ? row.confidence
+        : Math.round(calcRtConf(row, now, row.conflict_flag) * 10000) / 10000,
+      hit_count: row.hit_count,
+      is_protected: row.is_protected,
+      conflict_flag: row.conflict_flag,
+    }));
+  }
+
+  // 通道 3：KG 图谱召回桥
+  const kgResults = kgRecall(queryText, 15);
+  if (kgResults.length > 0) {
+    channels.kg = kgResults;
+  }
+
+  const channelCount = Object.keys(channels).length;
+
+  // 无通道
+  if (channelCount === 0) {
+    console.log(JSON.stringify({ action: 'search', diagnostics: { query: queryText, mode: 'empty', pool_size: 0 } }));
+    console.log('---RESULTS---');
     return;
   }
 
-  // Full hybrid search: cosine similarity + confidence decay
-  const now = Math.floor(Date.now() / 1000);
-  const alpha = 0.7;
-
-  function cosineSim(a, b) {
-    let dot = 0, na = 0, nb = 0;
-    for (let i = 0; i < a.length; i++) {
-      dot += a[i] * b[i];
-      na += a[i] * a[i];
-      nb += b[i] * b[i];
-    }
-    return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
-  }
-
-  withDb(db => {
-    const rows = db.prepare(`
-      SELECT c.id, c.text, c.embedding,
-        COALESCE(mc.confidence, 0.5) as confidence,
-        mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
-        COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
-        COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
-      FROM chunks c LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
-      WHERE COALESCE(mc.is_archived, 0) = 0
-    `).all();
-
-    const scored = [];
-    for (const row of rows) {
-      try {
-        const storedEmb = JSON.parse(row.embedding);
-        if (!storedEmb || storedEmb.length < 100) continue;
-        const similarity = cosineSim(queryEmbedding, storedEmb);
-        if (similarity < 0.35) continue; // gate (Qwen3-Embedding-4B threshold)
-        const rtConf = row.is_protected ? row.confidence : calcRtConf(row, now, row.conflict_flag);
-        const finalScore = alpha * similarity + (1 - alpha) * rtConf;
-        scored.push({
-          id: row.id, text: row.text, category: row.category,
-          similarity: Math.round(similarity * 10000) / 10000,
-          confidence_realtime: Math.round(rtConf * 10000) / 10000,
-          final_score: Math.round(finalScore * 10000) / 10000,
-          hit_count: row.hit_count, is_protected: row.is_protected,
-        });
-      } catch (e) {}
-    }
-
-    scored.sort((a, b) => b.final_score - a.final_score);
-    const top = scored.slice(0, topK);
-
+  // 单通道：直接输出
+  if (channelCount === 1) {
+    const single = Object.values(channels)[0];
+    const top = single.slice(0, topK);
+    const channelName = Object.keys(channels)[0];
     console.log(JSON.stringify({
       action: 'search',
       diagnostics: {
-        query: queryText, mode: 'hybrid', alpha,
-        pool_size: rows.length, gated: scored.length, returned: top.length,
+        query: queryText, mode: channelName + '_only',
+        pool_size: single.length, returned: top.length,
         top_scores: top.map(r => ({
-          id: r.id.slice(0, 16), sim: r.similarity, conf: r.confidence_realtime,
-          score: r.final_score, hits: r.hit_count, cat: r.category,
-          summary: r.text.slice(0, 60).replace(/\n/g, ' '),
+          id: r.id.slice(0, 16),
+          sim: r.similarity,
+          conf: r.confidence_realtime,
+          score: r.final_score || r.confidence_realtime,
+          hits: r.hit_count,
+          cat: r.category,
+          summary: (r.text || '').slice(0, 60).replace(/\n/g, ' '),
         })),
       },
     }));
     console.log('---RESULTS---');
-    top.forEach(r => console.log(JSON.stringify(r)));
+    top.forEach(r => console.log(JSON.stringify({ id: r.id, text: r.text, category: r.category, confidence_realtime: r.confidence_realtime, hit_count: r.hit_count, is_protected: r.is_protected, conflict_flag: r.conflict_flag })));
+    return;
+  }
+
+  // ≥2 通道：RRF 融合
+  const fusionMode = channelCount >= 3 ? 'rrf_multi' : 'rrf_dual';
+  let fused = rrfFuse(channels, rrfK);
+
+  // 时间意向检测 → episode 加权
+  const episodeBoost = hasTimeIntent(queryText) ? 0.1 : 0;
+  if (episodeBoost > 0) {
+    for (const item of fused) {
+      if (item.category === 'episodic') {
+        item.rrfScore += episodeBoost;
+      }
+    }
+    // 重新排序
+    fused.sort((a, b) => b.rrfScore - a.rrfScore);
+  }
+
+  const top = fused.slice(0, topK);
+
+  console.log(JSON.stringify({
+    action: 'search',
+    diagnostics: {
+      query: queryText,
+      mode: fusionMode,
+      fusion: 'rrf',
+      episode_boost: episodeBoost > 0,
+      channels: Object.keys(channels),
+      channel_sizes: Object.fromEntries(Object.entries(channels).map(([k, v]) => [k, v.length])),
+      pool_size: fused.length,
+      returned: top.length,
+      top_scores: top.map(r => ({
+        id: r.id.slice(0, 16),
+        rrf: r.rrfScore,
+        sources: r.sources,
+        sim: r.similarity,
+        conf: r.confidence_realtime,
+        hits: r.hit_count,
+        cat: r.category,
+        summary: (r.text || '').slice(0, 60).replace(/\n/g, ' '),
+      })),
+    },
+  }));
+  console.log('---RESULTS---');
+  top.forEach(r => console.log(JSON.stringify({
+    id: r.id,
+    text: r.text,
+    category: r.category,
+    similarity: r.similarity,
+    confidence_realtime: r.confidence_realtime,
+    rrf_score: r.rrfScore,
+    sources: r.sources,
+    hit_count: r.hit_count,
+    is_protected: r.is_protected,
+    conflict_flag: r.conflict_flag,
+  })));
+}
+
+// === 情节摘要生成 — 汇聚时间段内的 raw_log 为摘要 ===
+function generateEpisode(startTimestamp, endTimestamp) {
+  console.log(JSON.stringify({
+    action: 'summarize', status: 'start',
+    start: new Date(startTimestamp * 1000).toISOString(),
+    end: new Date(endTimestamp * 1000).toISOString(),
+  }));
+
+  const llmApiKey = getApiKey();
+  if (!llmApiKey) {
+    // 无 API Key 也生成伪摘要，供 Agent 后续手动填充
+    console.log(JSON.stringify({ action: 'summarize', status: 'no_llm', fallback: true }));
+  }
+
+  withDb(db => {
+    // 获取 raw_log chunks（不限路径，取所有未被归档的）
+    const logs = db.prepare(`
+      SELECT c.id, c.text
+      FROM chunks c
+      JOIN memory_confidence mc ON c.id = mc.chunk_id
+      WHERE mc.category = 'raw_log'
+        AND mc.is_archived = 0
+      ORDER BY c.path, c.start_line
+    `).all();
+
+    if (logs.length === 0) {
+      console.log(JSON.stringify({ action: 'summarize', status: 'no_logs' }));
+      return;
+    }
+
+    const chunkIds = logs.map(l => l.id);
+    const combined = logs.map(l => l.text).join('\n---\n').slice(0, 8000);
+
+    // 调用 LLM 生成摘要
+    let summary = '';
+    if (llmApiKey) {
+      try {
+                // 用临时文件避免 shell 转义问题
+        const payload = JSON.stringify({
+          model: 'deepseek-ai/DeepSeek-V4-Flash',
+          messages: [{ role: 'user', content: combined.slice(0, 6000) }],
+          max_tokens: 512,
+        });
+        const tmpFile = '/tmp/memory-episode-' + Date.now() + '.json';
+        fs.writeFileSync(tmpFile, payload, 'utf-8');
+
+        const resp = JSON.parse(execSync(
+          'curl -s -X POST "https://api.siliconflow.cn/v1/chat/completions" ' +
+          '-H "Authorization: Bearer ' + llmApiKey + '" ' +
+          '-H "Content-Type: application/json" ' +
+          '-d @' + tmpFile,
+          { encoding: 'utf-8', timeout: 30000 }
+        ));
+        fs.unlinkSync(tmpFile);
+        summary = (resp.choices?.[0]?.message?.content || '').trim();
+      } catch (e) {
+        console.log(JSON.stringify({ action: 'summarize', status: 'llm_error', message: e.message }));
+      }
+    }
+
+    if (!summary) {
+      // 无 LLM 或失败时，生成关键词摘要
+      const words = combined.split(/[\s,，。.\n]+/).filter(w => w.length >= 2);
+      const freq = {};
+      words.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
+      const top = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 20).map(e => e[0]);
+      summary = `[关键词摘要] ${top.slice(0, 10).join('、')}`;
+    }
+
+    // 写入摘要到记忆库（category = episodic）
+    smartAdd(summary, {
+      category: 'episodic',
+      kgData: { episode_of: chunkIds },
+    });
+
+    console.log(JSON.stringify({
+      action: 'summarize', status: 'done',
+      source_chunks: chunkIds.length,
+      summary_length: summary.length,
+      summary_preview: summary.slice(0, 100),
+    }));
   });
+}
+
+// === 情节下钻 — 通过摘要 chunk_id 获取原文 chunks ===
+function drillDown(chunkId, topK = 20) {
+  withDb(db => {
+    // 支持部分 ID 前缀匹配
+    const rows = db.prepare(`
+      SELECT chunk_id, kg_data, category FROM memory_confidence
+      WHERE chunk_id LIKE ?
+      LIMIT 2
+    `).all(chunkId + '%');
+
+    if (rows.length === 0) {
+      console.log(JSON.stringify({ action: 'drill', status: 'no_match', chunk_id: chunkId.slice(0, 16) }));
+      return;
+    }
+    if (rows.length > 1) {
+      console.log(JSON.stringify({ action: 'drill', status: 'multiple_matches', chunk_id: chunkId.slice(0, 16), matches: rows.length }));
+      return;
+    }
+
+    const row = rows[0];
+    if (!row.kg_data) {
+      console.log(JSON.stringify({ action: 'drill', status: 'no_kg_data', chunk_id: chunkId.slice(0, 16) }));
+      return;
+    }
+
+    let kgData;
+    try { kgData = JSON.parse(row.kg_data); } catch (e) {
+      console.log(JSON.stringify({ action: 'drill', status: 'invalid_kg_data' }));
+      return;
+    }
+
+    const sourceIds = kgData.episode_of;
+    if (!Array.isArray(sourceIds) || sourceIds.length === 0) {
+      console.log(JSON.stringify({ action: 'drill', status: 'no_source_ids' }));
+      return;
+    }
+
+    // 批量获取原文
+    const placeholders = sourceIds.map(() => '?').join(',');
+    const chunks = db.prepare(`
+      SELECT c.id, c.text,
+        COALESCE(mc.category, 'raw_log') as category,
+        COALESCE(mc.hit_count, 0) as hit_count
+      FROM chunks c
+      LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+      WHERE c.id IN (${placeholders})
+      ORDER BY c.path, c.start_line
+      LIMIT ?
+    `).all(...sourceIds, topK);
+
+    console.log(JSON.stringify({
+      action: 'drill',
+      chunk_id: chunkId.slice(0, 16),
+      category: row.category,
+      source_count: sourceIds.length,
+      returned: chunks.length,
+    }));
+    console.log('---DETAILS---');
+    chunks.forEach(c => console.log(JSON.stringify({
+      id: c.id.slice(0, 16),
+      text: c.text.slice(0, 300),
+      category: c.category,
+      hit_count: c.hit_count,
+    })));
+  });
+}
+
+// === 时间意向检测 — 用于 episode 加权 ===
+const TIME_KEYWORDS = /\b(上次|昨天|上周|之前|回顾|总结|做了什么|发生了什么|才做的|回顾一下|摘要|总结一下|当天|前一天|前几天|前些天|之前几天)\b/;
+
+function hasTimeIntent(query) {
+  return TIME_KEYWORDS.test(query);
+}
+
+function getApiKey() {
+  const configPath = path.resolve(HOME, '.openclaw/openclaw.json');
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const providers = cfg.models?.providers || {};
+    return providers.siliconflow?.apiKey || providers['siliconflow-embed']?.apiKey || '';
+  } catch (e) { return ''; }
 }
 
 function calcRtConf(row, now, conflictFlag) {
@@ -447,13 +839,27 @@ switch (command) {
     showStatus();
     break;
 
+  case 'summarize':
+    // 生成最近24小时的情节摘要
+    const now = Math.floor(Date.now() / 1000);
+    const windowHours = args.includes('--hours') ? parseInt(args[args.indexOf('--hours') + 1]) : 24;
+    generateEpisode(now - windowHours * 3600, now);
+    break;
+
+  case 'drill':
+    if (!args[1]) { console.log('Usage: node memory-engine.js drill <chunk-id> [--top-k <n>]'); process.exit(1); }
+    drillDown(args[1], parseInt(args.includes('--top-k') ? args[args.indexOf('--top-k') + 1] : '20'));
+    break;
+
   default:
     console.log('Usage:');
     console.log('  add <text> [--category <cat>] [--protected]     write file → index → confidence');
     console.log('  update <partial-id> [--category <cat>] [--hit]  update confidence fields');
-    console.log('  search <query> [--top-k <n>]                     list by confidence');
+    console.log('  search <query> [--top-k <n>]                     multi-channel RRF search');
     console.log('  archive                                           mark low-conf chunks');
     console.log('  diagnose                                          find untracked chunks');
     console.log('  status                                            show stats');
+    console.log('  summarize [--hours <n>]                           generate episodic summary');
+    console.log('  drill <chunk-id> [--top-k <n>]                    drill down into episode details');
     process.exit(1);
 }
