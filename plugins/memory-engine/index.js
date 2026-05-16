@@ -14,6 +14,7 @@ const KG_PATH = resolve(homedir(), ".openclaw/workspace/knowledge-graph.json");
 const CATEGORY_MAP = {
   temporary:       { conf: 0.40, tau: 2.0 },
   raw_log:         { conf: 0.50, tau: 7.0 },
+  episodic:        { conf: 0.70, tau: 30.0 },
   preference:      { conf: 0.70, tau: 30.0 },
   kg_node:         { conf: 0.85, tau: 90.0 },
   user_identity:   { conf: 0.95, tau: 365.0 },
@@ -147,6 +148,7 @@ export default definePluginEntry({
         `kg_node: 知识图谱结构结论（τ=90天）\n`,
         `raw_log: 日常对话/未提炼想法（τ=7天, 默认）\n`,
         `temporary: 临时/一次性（τ=2天）\n`,
+        `episodic: 情节摘要（τ=30天）\n`,
         `\n重要：用 search 后必须 cite（或 update --hit），否则记忆会衰减。`,
       ].join(''),
       parameters: {
@@ -159,7 +161,7 @@ export default definePluginEntry({
           text: { type: "string" },
           category: {
             type: "string",
-            enum: ["temporary", "raw_log", "preference", "kg_node", "user_identity"],
+            enum: ["temporary", "raw_log", "episodic", "preference", "kg_node", "user_identity"],
           },
           protected: { type: "boolean" },
           chunk_id: { type: "string" },
@@ -231,50 +233,195 @@ export default definePluginEntry({
 
           if (action === "search") {
             if (!text) return { error: "query text required for search" };
-            const { manager } = await getMemorySearchManager({});
-            let candidates;
-            if (manager) {
-              const raw = await manager.search(text, { limit: 30 });
-              candidates = raw?.entries || raw || [];
-            } else {
-              candidates = [];
-            }
-            const results = withDb(db => {
-              const confRows = db.prepare([
-                "SELECT chunk_id, confidence, last_confidence_update, base_tau,",
-                "hit_count, is_protected, conflict_flag, category, is_archived",
-                "FROM memory_confidence"
-              ].join(" ")).all();
-              const confMap = new Map(confRows.map(r => [r.chunk_id, r]));
-              const scored = [];
-              for (const c of candidates) {
-                const id = c.id || c.chunkId;
-                if (!id) continue;
-                const meta = confMap.get(id);
-                if (!meta || meta.is_archived) continue;
-                const rtConf = calcRealtimeConf(meta, nowSec);
-                const similarity = c.similarity ?? c.score ?? 0.5;
-                let finalScore = 0.7 * similarity + 0.3 * rtConf;
-                const KG_BOOST = 0.03;
-                if (meta.category === 'kg_node' && rtConf > 0.3) {
-                  finalScore += KG_BOOST;
-                }
-                scored.push({
-                  id: id.slice(0, 16),
-                  text: (c.text || c.content || "").slice(0, 200),
-                  category: meta.category,
-                  similarity: Math.round(similarity * 10000) / 10000,
-                  confidence: Math.round(rtConf * 10000) / 10000,
-                  score: Math.round(finalScore * 10000) / 10000,
-                  hits: meta.hit_count,
+
+            // Channel 1: Vector search via OpenClaw manager
+            let vectorCandidates = [];
+            try {
+              const { manager } = await getMemorySearchManager({});
+              if (manager) {
+                const raw = await manager.search(text, { limit: 30 });
+                vectorCandidates = raw?.entries || raw || [];
+              }
+            } catch (e) {}
+
+            // Channel 2: FTS5 full-text search
+            let ftsCandidates = [];
+            try {
+              const safeQuery = text.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+              if (safeQuery) {
+                withDb(db => {
+                  ftsCandidates = db.prepare(`
+                    SELECT c.id, c.text,
+                      COALESCE(mc.confidence, 0.5) as confidence,
+                      mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+                      COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+                      COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+                    FROM chunks_fts f
+                    JOIN chunks c ON c.id = f.id
+                    LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+                    WHERE chunks_fts MATCH ?
+                      AND COALESCE(mc.is_archived, 0) = 0
+                    ORDER BY bm25(chunks_fts, 0)
+                    LIMIT 20
+                  `).all(safeQuery);
                 });
               }
-              scored.sort((a, b) => b.score - a.score);
-              return scored.slice(0, k);
-            });
-            return { pool: candidates.length, results };
-          }
+            } catch (e) {}
 
+            // Channel 3: KG bridge (if kg.js exists)
+            let kgCandidates = [];
+            let kgActive = false;
+            const kgJsPath = resolve(WORKSPACE, 'kg.js');
+            try {
+              if (existsSync(kgJsPath)) {
+                const out = execSync(`node "${kgJsPath}" search ${JSON.stringify(text)} 2>/dev/null`, {
+                  encoding: 'utf-8', timeout: 10000
+                }).trim();
+                if (out && !out.startsWith('ℹ') && !out.startsWith('❌') && out !== '[]') {
+                  let concepts;
+                  try { concepts = JSON.parse(out); } catch(e) { concepts = []; }
+                  if (Array.isArray(concepts) && concepts.length > 0) {
+                    kgActive = true;
+                    const names = concepts.map(c => c.name).filter(Boolean);
+                    if (names.length > 0) {
+                      withDb(db => {
+                        const seen = new Set();
+                        for (const name of names) {
+                          const safeName = name.replace(/[^\w\s]/g, ' ').trim();
+                          if (!safeName || safeName.length < 2) continue;
+                          const rows = db.prepare(`
+                            SELECT DISTINCT c.id, c.text,
+                              COALESCE(mc.confidence, 0.5) as confidence,
+                              mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
+                              COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
+                              COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
+                            FROM chunks_fts f
+                            JOIN chunks c ON c.id = f.id
+                            LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
+                            WHERE chunks_fts MATCH ?
+                              AND COALESCE(mc.is_archived, 0) = 0
+                            ORDER BY bm25(chunks_fts, 0)
+                            LIMIT 3
+                          `).all(safeName);
+                          for (const row of rows) {
+                            if (seen.has(row.id)) continue;
+                            seen.add(row.id);
+                            kgCandidates.push(row);
+                            if (kgCandidates.length >= 15) break;
+                          }
+                          if (kgCandidates.length >= 15) break;
+                        }
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (e) {}
+
+            // Build channels from candidates
+            const channels = {};
+
+            if (vectorCandidates.length > 0) {
+              const scored = withDb(db => {
+                const confRows = db.prepare(`SELECT chunk_id, confidence, last_confidence_update, base_tau, hit_count, is_protected, conflict_flag, category, is_archived FROM memory_confidence`).all();
+                const confMap = new Map(confRows.map(r => [r.chunk_id, r]));
+                const res = [];
+                for (const c of vectorCandidates) {
+                  const id = c.id || c.chunkId;
+                  if (!id) continue;
+                  const meta = confMap.get(id);
+                  if (!meta || meta.is_archived) continue;
+                  const rtConf = meta.is_protected ? meta.confidence : calcRealtimeConf(meta, nowSec);
+                  const sim = c.similarity ?? c.score ?? 0.5;
+                  res.push({
+                    id, text: (c.text || c.content || "").slice(0, 600),
+                    category: meta.category,
+                    similarity: Math.round(sim * 10000) / 10000,
+                    confidence_realtime: Math.round(rtConf * 10000) / 10000,
+                    hit_count: meta.hit_count,
+                    is_protected: meta.is_protected,
+                    conflict_flag: meta.conflict_flag,
+                  });
+                }
+                res.sort((a, b) => b.similarity - a.similarity);
+                return res.slice(0, 30);
+              });
+              if (scored.length > 0) channels.vector = scored;
+            }
+
+            if (ftsCandidates.length > 0) {
+              channels.fts = ftsCandidates.map(row => ({
+                id: row.id, text: row.text.slice(0, 600),
+                category: row.category,
+                similarity: 0.5,
+                confidence_realtime: row.is_protected ? row.confidence
+                  : Math.round(calcRealtimeConf(row, nowSec) * 10000) / 10000,
+                hit_count: row.hit_count,
+                is_protected: row.is_protected,
+                conflict_flag: row.conflict_flag,
+              }));
+            }
+
+            if (kgCandidates.length > 0) {
+              channels.kg = kgCandidates.map(row => ({
+                id: row.id, text: row.text.slice(0, 600),
+                category: row.category,
+                similarity: 0.5,
+                confidence_realtime: row.is_protected ? row.confidence
+                  : Math.round(calcRealtimeConf(row, nowSec) * 10000) / 10000,
+                hit_count: row.hit_count,
+                is_protected: row.is_protected,
+                conflict_flag: row.conflict_flag,
+              }));
+            }
+
+            const channelCount = Object.keys(channels).length;
+            if (channelCount === 0) {
+              return { pool: 0, results: [], channels: [], note: "no channels returned results" };
+            }
+
+            // RRF fusion
+            const fusion = new Map();
+            for (const [chName, rankedItems] of Object.entries(channels)) {
+              rankedItems.forEach((item, idx) => {
+                const exist = fusion.get(item.id) || {
+                  id: item.id, text: item.text, category: item.category,
+                  sources: [], rrfScore: 0,
+                  similarity: item.similarity, confidence_realtime: item.confidence_realtime,
+                  hits: item.hit_count,
+                };
+                exist.sources.push(chName);
+                let acc = 0;
+                for (const [cn, items] of Object.entries(channels)) {
+                  const rank = items.findIndex(i => i.id === item.id);
+                  if (rank >= 0) acc += 1 / (60 + rank + 1);
+                }
+                exist.rrfScore = Math.round(acc * 10000) / 10000;
+                fusion.set(item.id, exist);
+              });
+            }
+
+            const fused = Array.from(fusion.values());
+            fused.sort((a, b) => b.rrfScore - a.rrfScore);
+            const results = fused.slice(0, k).map(item => ({
+              id: item.id.slice(0, 16),
+              text: item.text.slice(0, 200),
+              category: item.category,
+              rrf_score: item.rrfScore,
+              sources: item.sources,
+              similarity: item.similarity,
+              confidence: item.confidence_realtime,
+              hits: item.hits,
+            }));
+
+            return {
+              pool: fused.length,
+              channels: Object.keys(channels),
+              channel_sizes: Object.fromEntries(Object.entries(channels).map(([k, v]) => [k, v.length])),
+              kg_active: kgActive,
+              results,
+            };
+          }
           if (action === "cite") {
             if (!chunk_ids || chunk_ids.length === 0) return { error: "chunk_ids array required" };
             return withDb(db => {
