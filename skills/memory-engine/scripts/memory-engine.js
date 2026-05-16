@@ -305,20 +305,19 @@ function rrfPad(channels, k = 60, padMin = 5, padOffset = 100) {
 }
 
 // === KG 召回桥 — 知识图谱概念 → chunks 映射 ===
+// 直接加载 KG 模块，无需 execSync
 function kgRecall(queryText, limit = 15) {
-  const KG_JS = path.resolve(WORKSPACE, 'kg.js');
-  if (!fs.existsSync(KG_JS)) return [];
+  const KG_PATH = path.resolve(WORKSPACE, 'knowledge-graph.json');
+  const KG_MODULE = path.resolve(WORKSPACE, 'skills/jpeng-knowledge-graph-memory');
+  if (!fs.existsSync(KG_PATH) || !fs.existsSync(path.join(KG_MODULE, 'index.js'))) return [];
 
   try {
-    // 搜索 KG 获取相关概念
-    const out = execSync(`node ${KG_JS} search ${JSON.stringify(queryText)} 2>/dev/null`, {
-      encoding: 'utf-8', timeout: 10000
-    }).trim();
+    // 直接加载 KG 模块并搜索
+    const { KnowledgeGraph } = require(KG_MODULE);
+    const data = JSON.parse(fs.readFileSync(KG_PATH, 'utf-8'));
+    const kg = KnowledgeGraph.fromJSON(data);
+    const concepts = kg.search({ name: queryText });
 
-    if (!out || out.startsWith('ℹ️') || out.startsWith('❌') || out === '[]') return [];
-
-    let concepts = [];
-    try { concepts = JSON.parse(out); } catch (e) { return []; }
     if (!Array.isArray(concepts) || concepts.length === 0) return [];
 
     // 提取概念名列表

@@ -2,7 +2,6 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { getMemorySearchManager } from "openclaw/plugin-sdk/memory-core-engine-runtime";
 import Database from "better-sqlite3";
 import { mkdirSync, appendFileSync, existsSync, readFileSync } from "fs";
-import { execSync } from "child_process";
 import { resolve } from "path";
 import { homedir } from "os";
 
@@ -271,48 +270,46 @@ export default definePluginEntry({
             // Channel 3: KG bridge (if kg.js exists)
             let kgCandidates = [];
             let kgActive = false;
-            const kgJsPath = resolve(WORKSPACE, 'kg.js');
+            const kgJsonPath = resolve(WORKSPACE, 'knowledge-graph.json');
+            const kgModulePath = resolve(WORKSPACE, 'skills/jpeng-knowledge-graph-memory');
             try {
-              if (existsSync(kgJsPath)) {
-                const out = execSync(`node "${kgJsPath}" search ${JSON.stringify(text)} 2>/dev/null`, {
-                  encoding: 'utf-8', timeout: 10000
-                }).trim();
-                if (out && !out.startsWith('ℹ') && !out.startsWith('❌') && out !== '[]') {
-                  let concepts;
-                  try { concepts = JSON.parse(out); } catch(e) { concepts = []; }
-                  if (Array.isArray(concepts) && concepts.length > 0) {
-                    kgActive = true;
-                    const names = concepts.map(c => c.name).filter(Boolean);
-                    if (names.length > 0) {
-                      withDb(db => {
-                        const seen = new Set();
-                        for (const name of names) {
-                          const safeName = name.replace(/[^\w\s]/g, ' ').trim();
-                          if (!safeName || safeName.length < 2) continue;
-                          const rows = db.prepare(`
-                            SELECT DISTINCT c.id, c.text,
-                              COALESCE(mc.confidence, 0.5) as confidence,
-                              mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,
-                              COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,
-                              COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, 'raw_log') as category
-                            FROM chunks_fts f
-                            JOIN chunks c ON c.id = f.id
-                            LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id
-                            WHERE chunks_fts MATCH ?
-                              AND COALESCE(mc.is_archived, 0) = 0
-                            ORDER BY bm25(chunks_fts, 0)
-                            LIMIT 3
-                          `).all(safeName);
-                          for (const row of rows) {
-                            if (seen.has(row.id)) continue;
-                            seen.add(row.id);
-                            kgCandidates.push(row);
-                            if (kgCandidates.length >= 15) break;
-                          }
+              if (existsSync(kgJsonPath) && existsSync(resolve(kgModulePath, 'index.js'))) {
+                const KG = require(kgModulePath);
+                const data = JSON.parse(readFileSync(kgJsonPath, 'utf-8'));
+                const kg = KG.KnowledgeGraph.fromJSON(data);
+                const concepts = kg.search({ name: text });
+                if (Array.isArray(concepts) && concepts.length > 0) {
+                  kgActive = true;
+                  const names = concepts.map(c => c.name).filter(Boolean);
+                  if (names.length > 0) {
+                    withDb(db => {
+                      const seen = new Set();
+                      for (const name of names) {
+                        const safeName = name.replace(/[^\w\s]/g, ' ').trim();
+                        if (!safeName || safeName.length < 2) continue;
+                        const rows = db.prepare([
+                          'SELECT DISTINCT c.id, c.text,',
+                          '  COALESCE(mc.confidence, 0.5) as confidence,',
+                          '  mc.last_confidence_update, COALESCE(mc.base_tau, 7.0) as base_tau,',
+                          '  COALESCE(mc.hit_count, 0) as hit_count, COALESCE(mc.is_protected, 0) as is_protected,',
+                          '  COALESCE(mc.conflict_flag, 0) as conflict_flag, COALESCE(mc.category, \'raw_log\') as category',
+                          'FROM chunks_fts f',
+                          'JOIN chunks c ON c.id = f.id',
+                          'LEFT JOIN memory_confidence mc ON c.id = mc.chunk_id',
+                          'WHERE chunks_fts MATCH ?',
+                          '  AND COALESCE(mc.is_archived, 0) = 0',
+                          'ORDER BY bm25(chunks_fts, 0)',
+                          'LIMIT 3'
+                        ].join('\n')).all(safeName);
+                        for (const row of rows) {
+                          if (seen.has(row.id)) continue;
+                          seen.add(row.id);
+                          kgCandidates.push(row);
                           if (kgCandidates.length >= 15) break;
                         }
-                      });
-                    }
+                        if (kgCandidates.length >= 15) break;
+                      }
+                    });
                   }
                 }
               }
