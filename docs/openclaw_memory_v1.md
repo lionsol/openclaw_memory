@@ -334,5 +334,39 @@ agentmemory.add({
 |------|------|----------|
 | v1.0 | 2026-05-15 | 整合审查建议：防御性NULL处理、子图置信度字段、弱引用冷启动、归档二次确认、可配置参数、诊断日志 |
 | **v1.2** | **2026-05-16** | **FTS5 并行召回 + RRF 三通道融合 + KG 概念桥 + `episodic` 情节摘要 |
+| **v1.3** | **2026-05-18** | **Plugin contracts + image_vision + session-checkpoint + detectConfig + 冲突标记** |
+
+---
+
+## 10. v1.3 新增特性 (2026-05-18)
+
+### 10.1 Plugin Contracts 声明
+
+插件入口增加 `contracts: { tools: true }`，`openclaw.plugin.json` 增加工具名声明 `["memory_engine", "image_vision"]`，确保 OpenClaw 插件系统正确注册工具。
+
+### 10.2 image_vision 工具
+
+新注册 agent 工具，调用 SiliconFlow 的 Qwen3-VL-32B-Instruct 进行图片识别。参数：`image_path`（必填）+ `question`（可选），默认输出中文详细描述。
+
+### 10.3 自动配置检测 (detectConfig)
+
+`smart_add` 写入流程中增加自动分类探测：检测 API Key、Voice ID、模型名、文件路径、长哈希、中文配置关键词（"设置声音为…"等）时自动将 `raw_log` 提升为 `preference`（conf=0.80, tau=90天）。
+
+### 10.4 Session 检查点 (session-checkpoint.js)
+
+`scripts/session-checkpoint.js`，每日 03:55 CST 执行：
+
+1. 从 DB 读取昨日 raw_log + episodic 的文本
+2. 调用 SiliconFlow API 提取 `<key> = <value>` 形式的新配置
+3. 每条配置写入 preference 记忆
+4. 原始日志 → LLM 摘要（150-200字）→ 写入 episodic 类别
+5. **自动冲突标记**：同 key 配置保留最新，旧条目设 `conflict_flag=1`；唯一条目误标则自动解除
+
+### 10.5 Memory Prompt Supplement
+
+`registerMemoryPromptSupplement` 在 session 启动时动态注入：
+- `[昨日概要]` — 昨日 episode 摘要
+- `[受保护记忆]` — `user_identity` + `protected` 标记的记忆列表
+- 仅主 session 和 heartbeat session 生效
 
 此文档可直接交付工程团队执行。

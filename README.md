@@ -1,4 +1,4 @@
-# OpenClaw Memory System v1.2
+# OpenClaw Memory System v1.3
 
 > **存算分离 · 惰性衰减 · 实证强化**  
 > 为 AI Agent 构建的 SQLite 增强型长期记忆系统，具备置信度生命周期管理、知识图谱双轨融合与混合门控检索。
@@ -94,9 +94,11 @@ $$\text{Score}_{\text{final}} = 0.7 \cdot \text{Sim} + 0.3 \cdot \text{Conf}_{\t
 | `temporary` | 0.40 | 2 天 | 临时变量、单次任务 |
 | `raw_log` | 0.50 | 7 天 | 日常对话、未提炼想法 |
 | `episodic` | 0.70 | 30 天 | 情节摘要、会话总结 |
-| `preference` | 0.70 | 30 天 | 用户习惯、格式偏好 |
+| `preference` | 0.70 | 30 天(→90) | 用户习惯、**自动从raw_log升级** |
 | `kg_node` | 0.85 | 90 天 | 图谱提炼的结构化结论 |
 | `user_identity` | 0.95 | 365 天 | 核心身份、受保护信息 |
+
+> **自动分类升级**: `smart_add` 可识别配置关键词（API key、voice ID、model名、文件路径等），自动将 `raw_log` 提升为 `preference` 类别。
 
 ---
 
@@ -129,4 +131,13 @@ $$\text{Score}_{\text{final}} = 0.7 \cdot \text{Sim} + 0.3 \cdot \text{Conf}_{\t
 | v1.0 | 单通道：向量 + 置信度加权 |
 | v1.1 | 双通道：向量 + FTS5（简单并集） |
 | **v1.2** | **三通道：向量 + FTS5 + KG → RRF 融合** |
+
+### v1.3 (2026-05-18) — 插件合约 + session 检查点
+
+- **Plugin contracts** — 声明 `contracts: { tools: true }` 和工具名，完善 OpenClaw 插件注册
+- **image_vision 工具** — 注册到 memory-engine 插件，调用 Qwen3-VL-32B-Instruct 识别图片
+- **session-checkpoint.js** — 新脚本：每日 03:55 提取配置 → 写 preference → 生成 episode → 标记冲突
+- **detectConfig()** — smart_add 中自动检测配置关键词，将 raw_log 升级为 preference
+- **冲突自动标记** — 同 key 配置只保留最新，旧条目设 conflict_flag=1
+- **Prompt Supplement** — 动态注入昨日 episode + 受保护记忆，session 启动即 warm-start
 
