@@ -2,6 +2,9 @@
   "id": "memory-engine",
   "name": "Memory Engine",
   "description": "Enhanced memory with confidence scoring, time-decay, and lifecycle management.",
+  "contracts": {
+    "tools": ["memory_engine", "image_vision"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

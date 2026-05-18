@@ -105,6 +105,9 @@ export default definePluginEntry({
   id: "memory-engine",
   name: "Memory Engine",
   description: "Smart memory with confidence scoring, time-decay, and lifecycle management.",
+  contracts: {
+    tools: true,
+  },
   register(api) {
     // Ensure confidence table exists at startup
     try {
@@ -586,6 +589,48 @@ export default definePluginEntry({
           return { error: "unknown action", available: ["add", "search", "cite", "update", "status", "archive", "kg-bridge", "detect-conflicts"] };
         } catch (e) {
           return { error: e.message };
+        }
+      },
+    });
+
+    // Image Vision tool — 识别图片内容
+    api.registerTool({
+      name: "image_vision",
+      label: "图片识别",
+      description: "识别图片中的物体、场景、人物、动作等非文字内容。调用 Qwen3-VL-32B-Instruct (SiliconFlow)。传入图片路径和可选问句。",
+      parameters: {
+        type: "object",
+        properties: {
+          image_path: {
+            type: "string",
+            description: "图片文件路径（绝对路径或相对于工作区的路径）",
+          },
+          question: {
+            type: "string",
+            description: "问句，如省略则默认让模型描述图片内容",
+          },
+        },
+        required: ["image_path"],
+      },
+      async execute(_id, params) {
+        try {
+          const { execSync } = await import("child_process");
+          const scriptPath = resolve(WORKSPACE, "scripts/image-vision.py");
+          const imagePath = params.image_path;
+          const question = params.question || "请详细描述这张图片中的内容，包括物体、场景、人物（如有）、动作、氛围等。用中文回答。";
+          
+          if (!existsSync(scriptPath)) {
+            return { content: [{ type: "text", text: `脚本不存在: ${scriptPath}` }] };
+          }
+          
+          const result = execSync(
+            `python3 ${scriptPath} ${JSON.stringify(imagePath)} ${JSON.stringify(question)}`,
+            { encoding: "utf-8", timeout: 120000 }
+          );
+          
+          return { content: [{ type: "text", text: result.trim() }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: `图片识别失败: ${e.message}` }] };
         }
       },
     });
